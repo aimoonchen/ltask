@@ -1030,17 +1030,29 @@ ltask_init_root(lua_State *L) {
 }
 
 static int
+pushlog(struct ltask* task, service_id id, void *data, uint32_t sz) {
+	struct logmessage msg;
+	msg.id = id;
+	msg.msg = data;
+	msg.sz = sz;
+	struct timer *TI = task->timer;
+	struct logqueue *q = task->lqueue;
+	if (TI == NULL) {
+		msg.timestamp = 0;
+	} else {
+		msg.timestamp = timer_now(TI);
+	}
+	return logqueue_push(q, &msg);
+}
+
+static int
 ltask_boot_pushlog(lua_State *L) {
 	luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
 	struct ltask *task = (struct ltask *)get_ptr(L, "LTASK_GLOBAL");
 	service_id system_id = { SERVICE_ID_SYSTEM };
-	struct logmessage msg;
-	msg.msg = lua_touserdata(L, 1);
-	msg.sz = (uint32_t)luaL_checkinteger(L, 2);
-	msg.id = system_id;
-	msg.timestamp = timer_now(task->timer);
-	struct logqueue *q = task->lqueue;
-	if (logqueue_push(q, &msg)) {
+	void* data = lua_touserdata(L, 1);
+	uint32_t sz = (uint32_t)luaL_checkinteger(L, 2);
+	if (pushlog(task, system_id, data, sz)) {
 		return luaL_error(L, "log error");
 	}
 	return 0;
@@ -1490,20 +1502,11 @@ ltask_walltime(lua_State *L) {
 
 static int
 ltask_pushlog(lua_State *L) {
-	struct logmessage msg;
 	luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
-	msg.msg = lua_touserdata(L, 1);
-	msg.sz = (uint32_t)luaL_checkinteger(L, 2);
+	void* data = lua_touserdata(L, 1);
+	uint32_t sz = (uint32_t)luaL_checkinteger(L, 2);
 	const struct service_ud *S = getS(L);
-	msg.id = S->id;
-	struct timer *TI = S->task->timer;
-	struct logqueue *q = S->task->lqueue;
-	if (TI == NULL) {
-		msg.timestamp = 0;
-	} else {
-		msg.timestamp = timer_now(TI);
-	}
-	if (logqueue_push(q, &msg)) {
+	if (pushlog(S->task, S->id, data, sz)) {
 		return luaL_error(L, "log error");
 	}
 	return 0;
@@ -1526,6 +1529,14 @@ ltask_poplog(lua_State *L) {
 	lua_pushlightuserdata(L, msg.msg);
 	lua_pushinteger(L, msg.sz);
 	return 4;
+}
+
+static int
+ltask_get_pushlog(lua_State *L) {
+	const struct service_ud *S = getS(L);
+	lua_pushlightuserdata(L, pushlog);
+	lua_pushlightuserdata(L, S->task);
+	return 2;
 }
 
 static int
@@ -1673,6 +1684,7 @@ luaopen_ltask(lua_State *L) {
 		{ "walltime", ltask_walltime },
 		{ "pushlog", ltask_pushlog },
 		{ "poplog", ltask_poplog },
+		{ "get_pushlog", ltask_get_pushlog },
 		{ "mem_limit", ltask_memlimit },
 		{ "mem_count", ltask_memcount },
 		{ "label", ltask_label },
