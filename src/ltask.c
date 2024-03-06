@@ -387,7 +387,10 @@ wakeup_sleeping_workers(struct ltask *task, int jobs) {
 		int wakeup = jobs > sleeping_worker ? sleeping_worker : jobs;
 		int i;
 		for (i=0;i<total_worker && wakeup > 0;i++) {
-			wakeup -= worker_wakeup(&task->workers[i]);
+			struct worker_thread * w = &task->workers[i];
+			if (w->binding.id == 0) {
+				wakeup -= worker_wakeup(w);
+			}
 		}
 	}
 }
@@ -465,17 +468,13 @@ steal_job(struct worker_thread * worker) {
 static int
 schedule_dispatch_worker(struct worker_thread *worker) {
 	schedule_dispatch(worker->task);
-	if (!worker_has_job(worker)) {
-		service_id id = { 0 };
-		id = worker_assign_job(worker, id);
-		if (id.id == 0) {	// no binding service
-			service_id job = steal_job(worker);
-			if (job.id) {
-				debug_printf(worker->logger, "Steal service %x", job.id);
-				worker_assign_job(worker, job);
-			} else {
-				return 1;
-			}
+	if (!worker_has_job(worker) && worker->binding.id == 0) {
+		service_id job = steal_job(worker);
+		if (job.id) {
+			debug_printf(worker->logger, "Steal service %x", job.id);
+			atomic_int_store(&worker->service_ready, job.id);
+		} else {
+			return 1;
 		}
 	}
 	return 0;
@@ -628,6 +627,11 @@ thread_worker(void *ud) {
 						// Do it self
 						schedule_dispatch(w->task);
 						while (worker_complete_job(w)) {}	// CAS may fail spuriously
+					}
+					if (service_binding_get(P, id) == w->worker_id) {
+						w->binding = id;
+					} else {
+						w->binding.id = 0;
 					}
 					schedule_dispatch_worker(w);
 					release_scheduler(w);

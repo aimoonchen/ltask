@@ -47,6 +47,7 @@ struct worker_thread {
 #endif
 	int worker_id;
 	service_id running;
+	service_id binding;
 	atomic_int service_ready;
 	atomic_int service_done;
 	int term_signal;
@@ -97,6 +98,7 @@ worker_init(struct worker_thread *worker, struct ltask *task, int worker_id) {
 	atomic_int_init(&worker->service_done, 0);
 	cond_create(&worker->trigger);
 	worker->running.id = 0;
+	worker->binding.id = 0;
 	worker->term_signal = 0;
 	worker->sleeping = 0;
 	worker->wakeup = 0;
@@ -192,6 +194,7 @@ worker_get_job(struct worker_thread *worker) {
 static inline service_id
 worker_steal_job(struct worker_thread *worker, struct service_pool *p) {
 	service_id id = { 0 };
+	assert(worker->binding_queue.head == worker->binding_queue.tail);
 	int job = atomic_int_load(&worker->service_ready);
 	if (job) {
 		service_id t = { job };
