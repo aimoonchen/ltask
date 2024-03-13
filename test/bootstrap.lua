@@ -4,7 +4,6 @@ local arg = ...
 
 print "Bootstrap Begin"
 print(os.date("%c", (ltask.now())))
-
 local addr = ltask.spawn("user", "Hello")
 
 print("Spawn user", addr)
@@ -47,7 +46,6 @@ local se =ltask.queryservice "sockevent"
 print("PING sockevent", se)
 print(ltask.call(se , "ping", "PONG"))
 print(ltask.call(addr, "ping", "PONG"))
-print(ltask.send_direct(addr, "ping", "SEND"))
 ltask.send(addr, "exit")
 print(ltask.send(addr, "ping", "SEND"))
 
