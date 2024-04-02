@@ -1,6 +1,7 @@
 local ltask = require "ltask"
 
 local MESSAGE_RESPONSE <const> = 2
+local RECEIPT_BLOCK <const> = 3
 
 local messages = {}
 local timer = {}
@@ -63,16 +64,14 @@ local function send_blocked()
 	end
 end
 
-ltask.fork(function()
-	while true do
-		ltask.timer_update(messages)
-		send_all_messages()
-		ltask.timer_sleep(10)
-		if blocked then
-			send_blocked()
-		else
-			ltask.sleep(0)
-		end
+ltask.eventinit()	-- enable idle handler
+
+ltask.idle_handler(function ()
+	ltask.timer_update(messages)
+	send_all_messages()
+	ltask.timer_sleep(10)
+	if blocked then
+		send_blocked()
 	end
 end)
 

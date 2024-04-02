@@ -1,5 +1,3 @@
-local no_loop = ...
-
 local SERVICE_ROOT <const> = 1
 
 local MESSAGE_SYSTEM <const> = 0
@@ -7,10 +5,13 @@ local MESSAGE_REQUEST <const> = 1
 local MESSAGE_RESPONSE <const> = 2
 local MESSAGE_ERROR <const> = 3
 local MESSAGE_SIGNAL <const> = 4
+local MESSAGE_IDLE <const> = 5
 
 local RECEIPT_DONE <const> = 1
 local RECEIPT_ERROR <const> = 2
 local RECEIPT_BLOCK <const> = 3
+
+local SESSION_SEND_MESSAGE <const> = 0
 
 local SELECT_PROTO = {
 	system = MESSAGE_SYSTEM,
@@ -20,6 +21,7 @@ local SELECT_PROTO = {
 local ltask = require "ltask"
 
 local CURRENT_SERVICE <const> = ltask.self()
+local CURRENT_SERVICE_LABEL <const> = ltask.label()
 
 ltask.log = {}
 for _, level in ipairs {"info","error"} do
@@ -29,12 +31,12 @@ for _, level in ipairs {"info","error"} do
 		for i = 1, t.n do
 			str[#str+1] = tostring(t[i])
 		end
-		local message = table.concat(str, "\t")
+		local message = string.format("( %s ) %s", CURRENT_SERVICE_LABEL, table.concat(str, "\t"))
 		ltask.pushlog(ltask.pack(level, message))
 	end
 end
 
-ltask.log.info(string.format("${startup:%s}", ltask.label()))
+ltask.log.info ( "startup " .. CURRENT_SERVICE )
 
 local yield_service = coroutine.yield
 local yield_session = coroutine.yield
@@ -67,7 +69,7 @@ end
 function ltask.post_message(to, ...)
 	local r = post_message_(to, ...)
 	if r == nil then
-		error(string.format("${service:%d} is busy", to))
+		error(string.format("{service:%d} is busy", to))
 	end
 	return r
 end
@@ -76,10 +78,9 @@ local running_thread
 
 local session_coroutine_suspend_lookup = {}
 local session_coroutine_where = {}
-local session_coroutine_suspend = {}
 local session_coroutine_response = {}
 local session_coroutine_address = {}
-local session_id = 1
+local session_id = 2	-- 1 is reserved for root
 
 local session_waiting = {}
 local wakeup_queue = {}
@@ -279,7 +280,8 @@ local function report_error(addr, session, errobj)
 end
 
 function ltask.error(addr, session, errobj)
-	if session == 0 then
+	if session == SESSION_SEND_MESSAGE then
+		ltask.log.error(tostring(errobj))
 		return
 	end
 	ltask.send_message(addr, session, MESSAGE_ERROR, ltask.pack(errobj))
@@ -295,57 +297,9 @@ function ltask.error(addr, session, errobj)
 	end
 end
 
-local exclusive_service = false
-local exclusive_send = false
-local is_exclusive <const> = ltask.is_exclusive()
-
-if is_exclusive then
-	local exclusive = require "ltask.exclusive"
-	exclusive_service = exclusive.scheduling()
-	local blocked_message
-	local retry_blocked_message
-	local function post_message(address, session, type, msg, sz)
-		exclusive_send = true
-		if not exclusive.send(address, session, type, msg, sz) then
-			if blocked_message then
-				local n = #blocked_message
-				blocked_message[n+1] = address
-				blocked_message[n+2] = session
-				blocked_message[n+3] = type
-				blocked_message[n+4] = msg or false
-				blocked_message[n+5] = sz or false
-			else
-				blocked_message = { address, session, type, msg or false, sz or false }
-				ltask.fork(retry_blocked_message)
-			end
-		end
-	end
-	function retry_blocked_message()
-		ltask.sleep(0)
-		if not blocked_message then
-			return
-		end
-		local blocked = blocked_message
-		blocked_message = nil
-		for i = 1, #blocked, 5 do
-			local address = blocked[i]
-			local session = blocked[i+1]
-			local type    = blocked[i+2]
-			local msg     = blocked[i+3] or nil
-			local sz      = blocked[i+4] or nil
-			post_message(address, session, type, msg, sz)
-		end
-	end
-	function ltask.post_message(address, session, type, msg, sz)
-		post_message(address, session, type, msg, sz)
-		return true
-	end
-	function ltask.error(address, session, errobj)
-		if session == 0 then
-			return
-		end
-		post_message(address, session, MESSAGE_ERROR, ltask.pack(errobj))
-	end
+function ltask.rasie_error(addr, session, message)
+	local errobj = traceback(message, 4)
+	ltask.error(addr, session, errobj)
 end
 
 local function resume_session(co, ...)
@@ -363,7 +317,7 @@ local function resume_session(co, ...)
 		session_coroutine_response[co] = nil
 
 		errobj = traceback(errobj, co)
-		if from == nil or from == 0 or session == 0 then
+		if from == nil or from == 0 then
 			ltask.log.error(tostring(errobj))
 		else
 			ltask.error(from, session, errobj)
@@ -412,7 +366,7 @@ local SESSION = {}
 local function send_response(...)
 	local session = session_coroutine_response[running_thread]
 
-	if session > 0 then
+	if session ~= SESSION_SEND_MESSAGE then
 		local from = session_coroutine_address[running_thread]
 		ltask.post_message(from, session, MESSAGE_RESPONSE, ltask.pack(...))
 	end
@@ -430,7 +384,7 @@ end
 
 function ltask.call(address, ...)
 	if not ltask.post_message(address, session_id, MESSAGE_REQUEST, ltask.pack(...)) then
-		error(string.format("${service:%d} is dead", address))
+		error(string.format("{service:%d} is dead", address))
 	end
 	session_coroutine_suspend_lookup[session_id] = running_thread
 	session_id = session_id + 1
@@ -521,12 +475,12 @@ local ignore_response ; do
 end
 
 function ltask.send(address, ...)
-	return ltask.post_message(address, 0, MESSAGE_REQUEST, ltask.pack(...))
+	return ltask.post_message(address, SESSION_SEND_MESSAGE, MESSAGE_REQUEST, ltask.pack(...))
 end
 
 function ltask.syscall(address, ...)
 	if not ltask.post_message(address, session_id, MESSAGE_SYSTEM, ltask.pack(...)) then
-		error(string.format("${service:%d} is dead", address))
+		error(string.format("{service:%d} is dead", address))
 	end
 	session_coroutine_suspend_lookup[session_id] = running_thread
 	session_id = session_id + 1
@@ -672,20 +626,16 @@ function ltask.spawn(name, ...)
     return ltask.call(SERVICE_ROOT, "spawn", name, ...)
 end
 
-function ltask.kill(addr)
-    return ltask.call(SERVICE_ROOT, "kill", addr)
-end
-
-function ltask.register(name)
-    return ltask.call(SERVICE_ROOT, "register", name)
-end
-
 function ltask.queryservice(name)
     return ltask.call(SERVICE_ROOT, "queryservice", name)
 end
 
 function ltask.uniqueservice(name, ...)
     return ltask.call(SERVICE_ROOT, "uniqueservice", name, ...)
+end
+
+function ltask.spawn_service(name, ...)
+    return ltask.call(SERVICE_ROOT, "spawn_service", name, ...)
 end
 
 do ------ request/select
@@ -924,15 +874,13 @@ end
 local quit
 
 function ltask.quit()
-	if not is_exclusive then
-		ltask.fork(function ()
-			for co, addr in pairs(session_coroutine_address) do
-				local session = session_coroutine_response[co]
-				ltask.error(addr, session, "Service has been quit.")
-			end
-			quit = true
-		end)
-	end
+	ltask.fork(function ()
+		for co, addr in pairs(session_coroutine_address) do
+			local session = session_coroutine_response[co]
+			ltask.rasie_error(addr, session, "Service has been quit.")
+		end
+		quit = true
+	end)
 end
 
 local service = nil
@@ -952,12 +900,20 @@ function ltask.dispatch(handler)
 	return service
 end
 
-function ltask.signal_handler(f)	-- root only
-	SESSION[MESSAGE_SIGNAL] = function (type, msg, sz)
+local function register_handler(msg_type, f)
+	SESSION[msg_type] = function (type)
 		local from = session_coroutine_address[running_thread]
 		local session = session_coroutine_response[running_thread]
 		f(from, session)
 	end
+end
+
+function ltask.signal_handler(f)	-- root only
+	register_handler(MESSAGE_SIGNAL, f)
+end
+
+function ltask.idle_handler(f)
+	register_handler(MESSAGE_IDLE, f)
 end
 
 local yieldable_require; do
@@ -1032,26 +988,10 @@ end
 local function sys_service_init(t)
 	-- The first system message
 	_G.require = yieldable_require
-	if t.preload then
-		if t.preload:sub(1,1) == "@" then
-			assert(loadfile(t.preload:sub(2)))()
-		else
-			assert(load(t.preload))()
-		end
-	end
-	if t.lua_path then
-		package.path = t.lua_path
-	end
-	if t.lua_cpath then
-		package.cpath = t.lua_cpath
-	end
-	if t.name then
-		local filename = assert(package.searchpath(t.name, t.service_path))
-		local f = assert(loadfile(filename))
-		local handler = f(table.unpack(t.args))
-		ltask.dispatch(handler)
-	else
-	end
+	local initfunc = assert(load(t.initfunc))
+	local func = assert(initfunc(t.name))
+	local handler = func(table.unpack(t.args))
+	ltask.dispatch(handler)
 	if service == nil then
 		ltask.quit()
 	end
@@ -1072,6 +1012,8 @@ end
 function sys_service.quit()
 	if service and service.quit then
 		return service.quit()
+	else
+		ltask.quit()
 	end
 end
 
@@ -1105,72 +1047,39 @@ SESSION[MESSAGE_REQUEST] = function (type, msg, sz)
 	request(ltask.unpack_remove(msg, sz))
 end
 
-local function dispatch_wakeup()
-	while #wakeup_queue > 0 do
-		local s = table.remove(wakeup_queue, 1)
-		wakeup_session(table.unpack(s))
-	end
-	if exclusive_send then
-		exclusive_service()	-- send messages
-		exclusive_send = false
-	end
-end
-
-local SCHEDULE_IDLE <const> = 1
-local SCHEDULE_QUIT <const> = 2
-local SCHEDULE_SUCCESS <const> = 3
-
-function ltask.schedule_message()
+local function schedule_message()
 	local from, session, type, msg, sz = ltask.recv_message()
 	local f = SESSION[type]
 	if f then
 		-- new session for this message
 		local co = new_session(f, from, session)
 		wakeup_session(co, type, msg, sz)
-	elseif session then
+	else
 		local co = session_coroutine_suspend_lookup[session]
 		if co == nil then
-			print("Unknown response session : ", session)
-			ltask.remove(msg, sz)
-			ltask.quit()
+			print("Unknown response session : ", session, "from", from, "type", type, ltask.unpack_remove(msg, sz))
 		else
 			session_coroutine_suspend_lookup[session] = nil
 			wakeup_session(co, type, session, msg, sz)
 		end
-	else
-		dispatch_wakeup()
-		return SCHEDULE_IDLE
 	end
-	dispatch_wakeup()
-	if quit then
-		return SCHEDULE_QUIT
+	while #wakeup_queue > 0 do
+		local s = table.remove(wakeup_queue, 1)
+		wakeup_session(table.unpack(s))
 	end
-	return SCHEDULE_SUCCESS
 end
-
-ltask.dispatch_wakeup = dispatch_wakeup
 
 print = ltask.log.info
 
 local function mainloop()
 	while true do
-		local s = ltask.schedule_message()
-		if s ~= SCHEDULE_SUCCESS then
-			if s == SCHEDULE_IDLE then
-				local onidle = ltask.on_idle
-				if onidle then
-					onidle()
-				end
-			else
-				-- s == SCHEDULE_QUIT
-				ltask.log.info "${quit}"
-				return
-			end
+		schedule_message()
+		if quit then
+			ltask.log.info "quit."
+			return
 		end
 		yield_service()
 	end
 end
 
-if not no_loop then
-	mainloop()
-end
+mainloop()

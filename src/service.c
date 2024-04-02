@@ -51,8 +51,8 @@ struct service {
 	struct message *bounce;
 	int status;
 	int receipt;
-	int thread_id;
 	int binding_thread;
+	int sockevent_id;
 	service_id id;
 	char label[32];
 	struct memory_stat stat;
@@ -173,8 +173,8 @@ service_new(struct service_pool *p, unsigned int sid) {
 	s->receipt = MESSAGE_RECEIPT_NONE;
 	s->id.id = id;
 	s->status = SERVICE_STATUS_UNINITIALIZED;
-	s->thread_id = -1;
 	s->binding_thread = -1;
+	s->sockevent_id = -1;
 	s->cpucost = 0;
 	s->clock = 0;
 	*service_slot(p, id) = s;
@@ -188,14 +188,6 @@ get_service(struct service_pool *p, service_id id) {
 	if (S == NULL || S->id.id != id.id)
 		return NULL;
 	return S;
-}
-
-static void
-replace_service(struct service_pool *p, service_id id, struct service *s) {
-	struct service *S = *service_slot(p, id.id);
-	(void)S;
-	assert(S->id.id == id.id);
-	*service_slot(p, id.id) = s;
 }
 
 static inline int
@@ -265,80 +257,22 @@ error_message(lua_State *fromL, lua_State *toL, const char *msg) {
 	}
 }
 
-static int
-preinit(lua_State *L) {
-	luaL_openlibs(L);
-	lua_gc(L, LUA_GCGEN, 0, 0);
-	const char * source = (const char *)lua_touserdata(L, 1);
-	if (luaL_loadstring(L, source) != LUA_OK) {
-		return lua_error(L);
-	}
-	return 1;
-}
-
-void *
-service_preinit_L(struct service *s) {
-	return s->L;
-}
-
-struct service *
-service_preinit(void *pL, const char *source) {
-	struct service *s = (struct service *)malloc(sizeof(*s));
-	struct memory_stat *stat = &s->stat;
-	memset(stat, 0, sizeof(*stat));
-	lua_State *L = lua_newstate(service_alloc, stat);
-	if (L == NULL) {
-		free(s);
-	}
-	lua_pushcfunction(L, preinit);
-	lua_pushlightuserdata(L, (void *)source);
-	if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-		size_t sz;
-		const char * err = lua_tolstring(L, -1, &sz);
-		char msg[4096];
-		if (sz > sizeof(msg)) {
-			sz = sizeof(msg);
-		}
-		memcpy(msg, err, sz);
-		lua_close(L);
-		free(s);
-		L = (lua_State *)pL;
-		lua_pushlstring(L, msg, sz);
-		lua_error(L);
-		return NULL;
-	}
-	s->L = L;
-	return s;
-}
-
 int
-service_init(struct service_pool *p, service_id id, void *ud, size_t sz, void *pL, struct service *preS) {
+service_init(struct service_pool *p, service_id id, void *ud, size_t sz, void *pL) {
 	struct service *S = get_service(p, id);
 	assert(S != NULL && S->L == NULL && S->status == SERVICE_STATUS_UNINITIALIZED);
 	lua_State *L;
-	if (preS == NULL) {
-		memset(&S->stat, 0, sizeof(S->stat));
-		L = lua_newstate(service_alloc, &S->stat);
-		if (L == NULL)
-			return 1;
-		lua_pushcfunction(L, init_service);
-		lua_pushlightuserdata(L, ud);
-		lua_pushinteger(L, sz);
-		if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
-			error_message(L, pL, "Init lua state error");
-			lua_close(L);
-			return 1;
-		}
-	} else {
-		replace_service(p, id, preS);
-		struct memory_stat stat = preS->stat;
-		L = preS->L;
-		memcpy(preS, S, sizeof(struct service));
-		free(S);
-		S = preS;
-		S->stat = stat;
-		S->status = SERVICE_STATUS_IDLE;
-		init_service_key(L, ud, sz);
+	memset(&S->stat, 0, sizeof(S->stat));
+	L = lua_newstate(service_alloc, &S->stat);
+	if (L == NULL)
+		return 1;
+	lua_pushcfunction(L, init_service);
+	lua_pushlightuserdata(L, ud);
+	lua_pushinteger(L, sz);
+	if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+		error_message(L, pL, "Init lua state error");
+		lua_close(L);
+		return 1;
 	}
 	S->msg = queue_new_ptr(p->queue_length);
 	if (S->msg == NULL) {
@@ -439,36 +373,13 @@ service_delete(struct service_pool *p, service_id id) {
 	}
 }
 
-static inline lua_State *
-service_L(struct service_pool *p, service_id id) {
-	struct service *S= get_service(p, id);
-	if (S == NULL)
-		return NULL;
-	return S->L;
-}
-
 const char *
-service_loadfile(struct service_pool *p, service_id id, const char *filename) {
+service_loadstring(struct service_pool *p, service_id id, const char *source, size_t source_sz, const char *chunkname) {
 	struct service *S= get_service(p, id);
 	if (S == NULL || S->L == NULL)
 		return "Init service first";
 	lua_State *L = S->L;
-	if (luaL_loadfile(L, filename) != LUA_OK) {
-		const char * r = lua_tostring(S->L, -1);
-		S->status = SERVICE_STATUS_DEAD;
-		return r;
-	}
-	S->status = SERVICE_STATUS_IDLE;
-	return NULL;
-}
-
-const char *
-service_loadstring(struct service_pool *p, service_id id, const char *source) {
-	struct service *S= get_service(p, id);
-	if (S == NULL || S->L == NULL)
-		return "Init service first";
-	lua_State *L = S->L;
-	if (luaL_loadstring(L, source) != LUA_OK) {
+	if (luaL_loadbuffer(L, source, source_sz, chunkname) != LUA_OK) {
 		const char * r = lua_tostring(S->L, -1);
 		S->status = SERVICE_STATUS_DEAD;
 		return r;
@@ -478,11 +389,10 @@ service_loadstring(struct service_pool *p, service_id id, const char *source) {
 }
 
 int
-service_resume(struct service_pool *p, service_id id, int thread_id) {
+service_resume(struct service_pool *p, service_id id) {
 	struct service *S= get_service(p, id);
 	if (S == NULL)
 		return 1;
-	S->thread_id = thread_id;
 	lua_State *L = S->L;
 	if (L == NULL)
 		return 1;
@@ -510,22 +420,6 @@ service_resume(struct service_pool *p, service_id id, int thread_id) {
 	lua_pop(L, 3);
 	return 1;
 }
-
-int
-service_thread_id(struct service_pool *p, service_id id) {
-	struct service *S= get_service(p, id);
-	if (S == NULL)
-		return -1;
-	return S->thread_id;
-}
-
-void
- service_bind_thread(struct service_pool *p, service_id id, int thread_id) {
-	struct service *S= get_service(p, id);
-	if (S == NULL)
-		return;
-	S->thread_id = thread_id;
- }
 
 int
 service_push_message(struct service_pool *p, service_id id, struct message *msg) {
@@ -765,4 +659,20 @@ service_binding_set(struct service_pool *p, service_id id, int worker_thread) {
 	if (S == NULL)
 		return;
 	S->binding_thread = worker_thread;
+}
+
+int
+service_sockevent_get(struct service_pool *p, service_id id) {
+	struct service *S= get_service(p, id);
+	if (S == NULL)
+		return -1;
+	return S->sockevent_id;
+}
+
+void
+service_sockevent_init(struct service_pool *p, service_id id, int index) {
+	struct service *S= get_service(p, id);
+	if (S == NULL)
+		return;
+	S->sockevent_id = index;
 }
