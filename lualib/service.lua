@@ -13,11 +13,6 @@ local RECEIPT_BLOCK <const> = 3
 
 local SESSION_SEND_MESSAGE <const> = 0
 
-local SELECT_PROTO = {
-	system = MESSAGE_SYSTEM,
-	request = MESSAGE_REQUEST,
-}
-
 local ltask = require "ltask"
 
 local CURRENT_SERVICE <const> = ltask.self()
@@ -44,40 +39,9 @@ local function continue_session()
 	coroutine.yield(true)
 end
 
------ send message ------
-local post_message_ ; do
-	function post_message_(to, session, type, msg, sz)
-		ltask.send_message(to, session, type, msg, sz)
-		continue_session()
-		local type, msg, sz = ltask.message_receipt()
-		if type == RECEIPT_DONE then
-			return true
-		elseif type == RECEIPT_ERROR then
-			ltask.remove(msg, sz)
-			return false
-		elseif type == RECEIPT_BLOCK then
-			-- todo: send again
-			ltask.remove(msg, sz)
-			return nil
-		else
-			-- RECEIPT_RESPONSE(4) (msg is session)
-			return msg
-		end
-	end
-end
-
-function ltask.post_message(to, ...)
-	local r = post_message_(to, ...)
-	if r == nil then
-		error(string.format("{service:%d} is busy", to))
-	end
-	return r
-end
-
 local running_thread
 
 local session_coroutine_suspend_lookup = {}
-local session_coroutine_where = {}
 local session_coroutine_response = {}
 local session_coroutine_address = {}
 local session_id = 2	-- 1 is reserved for root
@@ -259,18 +223,20 @@ local function rethrow_error(level, errobj)
 	end
 end
 
-local function report_error(addr, session, errobj)
-	ltask.send_message(SERVICE_ROOT, 0, MESSAGE_REQUEST, ltask.pack("report_error", addr, session, errobj))
+function ltask.post_message(addr, session, type, msg, sz)
+	ltask.send_message(addr, session, type, msg, sz)
 	continue_session()
+	return ltask.message_receipt()
+end
+
+local function send_blocked_message(addr, session, type, ...)
+	local msg, sz = ltask.pack("send_retry", addr, session, type, ...)
 	while true do
-		local type, msg, sz = ltask.message_receipt()
-		if type == RECEIPT_DONE then
+		local receipt_type = ltask.post_message(SERVICE_ROOT, SESSION_SEND_MESSAGE, MESSAGE_REQUEST, msg, sz)
+		if receipt_type == RECEIPT_DONE then
 			break
-		elseif type == RECEIPT_BLOCK then
-			-- retry "report_error"
+		elseif receipt_type == RECEIPT_BLOCK then
 			ltask.sleep(1)
-			ltask.send_message(SERVICE_ROOT, 0, MESSAGE_REQUEST, msg, sz)
-			continue_session()
 		else
 			-- error (root quit?)
 			ltask.remove(msg, sz)
@@ -279,27 +245,45 @@ local function report_error(addr, session, errobj)
 	end
 end
 
-function ltask.error(addr, session, errobj)
-	if session == SESSION_SEND_MESSAGE then
-		ltask.log.error(tostring(errobj))
+local function post_request_message(addr, session, type, msg, sz)
+	local receipt_type, receipt_msg, receipt_sz = ltask.post_message(addr, session, type, msg, sz)
+	if receipt_type == RECEIPT_DONE then
 		return
 	end
-	ltask.send_message(addr, session, MESSAGE_ERROR, ltask.pack(errobj))
-	continue_session()
-	local type, msg, sz = ltask.message_receipt()
-	if type ~= RECEIPT_DONE then
-		ltask.remove(msg, sz)
-		if type == RECEIPT_BLOCK then
-			ltask.timeout(0, function ()
-				report_error(addr, session, errobj)
-			end)
+	if receipt_type == RECEIPT_ERROR then
+		ltask.remove(receipt_msg, receipt_sz)
+		if session ~= SESSION_SEND_MESSAGE then
+			error(string.format("{service:%d} is dead", addr))
 		end
+	else
+		--RECEIPT_BLOCK
+		-- todo: send again
+		ltask.remove(receipt_msg, receipt_sz)
+		error(string.format("{service:%d} is busy", addr))
+	end
+end
+
+local function post_response_message(addr, session, type, msg, sz)
+	local receipt_type, receipt_msg, receipt_sz = ltask.post_message(addr, session, type, msg, sz)
+	if receipt_type == RECEIPT_DONE then
+		return
+	end
+	if receipt_type == RECEIPT_ERROR then
+		ltask.remove(receipt_msg, receipt_sz)
+	else
+		--RECEIPT_BLOCK
+		ltask.fork(function ()
+			send_blocked_message(addr, session, type, ltask.unpack_remove(receipt_msg, receipt_sz))
+		end)
 	end
 end
 
 function ltask.rasie_error(addr, session, message)
+	if session == SESSION_SEND_MESSAGE then
+		return
+	end
 	local errobj = traceback(message, 4)
-	ltask.error(addr, session, errobj)
+	post_response_message(addr, session, MESSAGE_ERROR, ltask.pack(errobj))
 end
 
 local function resume_session(co, ...)
@@ -317,10 +301,10 @@ local function resume_session(co, ...)
 		session_coroutine_response[co] = nil
 
 		errobj = traceback(errobj, co)
-		if from == nil or from == 0 then
+		if from == nil or from == 0 or session == SESSION_SEND_MESSAGE then
 			ltask.log.error(tostring(errobj))
 		else
-			ltask.error(from, session, errobj)
+			post_response_message(from, session, MESSAGE_ERROR, ltask.pack(errobj))
 		end
 		coroutine.close(co)
 	end
@@ -368,7 +352,7 @@ local function send_response(...)
 
 	if session ~= SESSION_SEND_MESSAGE then
 		local from = session_coroutine_address[running_thread]
-		ltask.post_message(from, session, MESSAGE_RESPONSE, ltask.pack(...))
+		post_response_message(from, session, MESSAGE_RESPONSE, ltask.pack(...))
 	end
 
 	-- End session
@@ -383,9 +367,7 @@ function ltask.suspend(session, co)
 end
 
 function ltask.call(address, ...)
-	if not ltask.post_message(address, session_id, MESSAGE_REQUEST, ltask.pack(...)) then
-		error(string.format("{service:%d} is dead", address))
-	end
+	post_request_message(address, session_id, MESSAGE_REQUEST, ltask.pack(...))
 	session_coroutine_suspend_lookup[session_id] = running_thread
 	session_id = session_id + 1
 	local type, session, msg, sz = yield_session()
@@ -430,10 +412,7 @@ do	-- async object
 	end
 
 	function async:request(address, ...)
-		if not ltask.post_message(address, session_id, MESSAGE_REQUEST, ltask.pack(...)) then
-			-- service dead
-			return
-		end
+		post_request_message(address, session_id, MESSAGE_REQUEST, ltask.pack(...))
 		session_coroutine_suspend_lookup[session_id] = self._wait
 		self._sessions[session_id] = true
 		session_id = session_id + 1
@@ -450,38 +429,12 @@ do	-- async object
 	end
 end
 
-local ignore_response ; do
-	local function no_response_()
-		while true do
-			local type, session, msg, sz = yield_session()
-			if type == MESSAGE_ERROR then
-				local errobj = ltask.unpack_remove(msg, sz)
-				errobj = traceback(errobj, session_coroutine_where[session] or "")
-				ltask.log.error(tostring(errobj))
-			else
-				ltask.remove(msg, sz)
-			end
-			session_coroutine_where[session] = nil
-		end
-	end
-
-	local no_response_handler = coroutine.create(no_response_)
-	coroutine.resume(no_response_handler)
-
-	function ignore_response(session_id, where)
-		session_coroutine_where[session_id] = where
-		session_coroutine_suspend_lookup[session_id] = no_response_handler
-	end
-end
-
 function ltask.send(address, ...)
-	return ltask.post_message(address, SESSION_SEND_MESSAGE, MESSAGE_REQUEST, ltask.pack(...))
+	post_request_message(address, SESSION_SEND_MESSAGE, MESSAGE_REQUEST, ltask.pack(...))
 end
 
 function ltask.syscall(address, ...)
-	if not ltask.post_message(address, session_id, MESSAGE_SYSTEM, ltask.pack(...)) then
-		error(string.format("{service:%d} is dead", address))
-	end
+	post_request_message(address, session_id, MESSAGE_SYSTEM, ltask.pack(...))
 	session_coroutine_suspend_lookup[session_id] = running_thread
 	session_id = session_id + 1
 	local type, session,  msg, sz = yield_session()
@@ -496,7 +449,9 @@ end
 function ltask.sleep(ti)
 	session_coroutine_suspend_lookup[session_id] = running_thread
 	if ti == 0 then
-		ltask.post_message(CURRENT_SERVICE, session_id, MESSAGE_RESPONSE)
+		if RECEIPT_DONE ~= ltask.post_message(CURRENT_SERVICE, session_id, MESSAGE_RESPONSE) then
+			ltask.timer_add(session_id, 0)
+		end
 	else
 		ltask.timer_add(session_id, ti)
 	end
@@ -524,7 +479,9 @@ function ltask.timeout(ti, func)
 	local co = new_thread(func)
 	session_coroutine_suspend_lookup[session_id] = co
 	if ti == 0 then
-		ltask.post_message(CURRENT_SERVICE, session_id, MESSAGE_RESPONSE)
+		if RECEIPT_DONE ~= ltask.post_message(CURRENT_SERVICE, session_id, MESSAGE_RESPONSE) then
+			ltask.timer_add(session_id, 0)
+		end
 	else
 		ltask.timer_add(session_id, ti)
 	end
@@ -638,234 +595,72 @@ function ltask.spawn_service(name, ...)
     return ltask.call(SERVICE_ROOT, "spawn_service", name, ...)
 end
 
-do ------ request/select
-	local function request_thread(self)
-		local co = new_thread(function()
-			while true do
-				local type, session, msg, sz = yield_session()
-				if session == self._timeout then
-					self.timeout = true
-					self._timeout = nil
-				elseif type == MESSAGE_RESPONSE then
-					self._resp[session] = { ltask.unpack_remove(msg, sz) }
-				else
-					self._request = self._request - 1
-					local req = self._sessions[session]
-					req.error = (ltask.unpack_remove(msg, sz))
-					local err = self._error
-					if not err then
-						err = {}
-						self._error = err
-					end
-					err[#err+1] =req
-				end
-				ltask.wakeup(self)
-			end
-		end)
-		coroutine.resume(co)
-		return co
+function ltask.parallel(task)
+	local n = #task
+	if n == 0 then
+		return function () end
 	end
-
-	local function send_requests(self, timeout)
-		local sessions = {}
-		self._sessions = sessions
-		self._where = create_traceback(running_thread, 3)
-		self._resp = {}
-		local request_n = 0
-		local err
-		local req_thread = request_thread(self)
-		for i = 1, #self do
-			local req = self[i]
-			-- send request
-			local address = req[1]
-			local proto = req.proto and assert(SELECT_PROTO[req.proto]) or MESSAGE_REQUEST
-			local session = session_id
-			session_coroutine_suspend_lookup[session] = req_thread
-			session_id = session_id + 1
-
-			if not ltask.post_message(address, session, proto, ltask.pack(table.unpack(req, 2))) then
-				err = err or {}
-				req.error = true	-- address is dead
-				err[#err+1] = req
-			else
-				sessions[session] = req
-				request_n = request_n + 1
-			end
-		end
-		if timeout then
-			session_coroutine_suspend_lookup[session_id] = req_thread
-			ltask.timer_add(session_id, timeout)
-			self._timeout = session_id
-			session_id = session_id + 1
-		end
-		self._request = request_n
-		self._error = err
+	local ret_head = 0
+	local ret_tail = 0
+	local ret = {}
+	local token
+	local function rethrow(res)
+		rethrow_error(2, res.error)
 	end
-
-	local function ignore_timout(self)
-		if self._timeout then
-			ignore_response(self._timeout, self._where)
-			self._timeout = nil
+	local function resp(t, ok, ...)
+		local res = {}
+		if ok then
+			res = table.pack(...)
+		else
+			res.error = ...
+			res.rethrow = rethrow
+		end
+		ret_tail = ret_tail + 1
+		ret[ret_tail] = { t, res }
+		if token then
+			ltask.wakeup(token)
+			token = nil
 		end
 	end
-
-	local function pop_error(self)
-		local req = table.remove(self._error)
-		if req then
-			req.error = tostring(traceback(req.error, 4))
-			return req
+	local idx = 1
+	local supervisor_running = false
+	local run_task	-- function
+	local function next_task()
+		local i = idx
+		idx = idx + 1
+		local t = task[i]
+		if t then
+			run_task(t)
 		end
 	end
-
-	local function request_iter(self)
-		local timeout_session = self._timeout
-		return function()
-			if self._error and #self._error > 0 then
-				return pop_error(self)
-			end
-
-			local session, resp = next(self._resp)
-			if session == nil then
-				if self._request == 0 then
-					return
-				end
-				if self.timeout then
-					return
-				end
-				ltask.wait(self)
-				if self.timeout then
-					return
-				end
-				session, resp = next(self._resp)
-				if session == nil then
-					return pop_error(self)
-				end
-			end
-
-			self._request = self._request - 1
-			local req = self._sessions[session]
-			self._resp[session] = nil
-			self._sessions[session] = nil
-			return req, resp
-		end
+	local function run_supervisor()
+		supervisor_running = false	-- only one supervisor
+		next_task()
 	end
-
-	local request_meta = {}	; request_meta.__index = request_meta
-
-	function request_meta:add(obj)
-		assert(self._request == nil)	-- select starts
-		self[#self+1] = obj
-		return self
+	local function error_handler(errobj)
+		return traceback(errobj, 4)
 	end
-
-	request_meta.__call = request_meta.add
-
-	function request_meta:close()
-		if self._request > 0 then
-			for session, req in pairs(self._sessions) do
-				if not self._resp[session] then
-					ignore_response(session, self._where)
-				end
-			end
-			self._request = 0
+	function run_task(t)
+		if not supervisor_running then
+			supervisor_running = true
+			ltask.fork(run_supervisor)
 		end
-		ignore_timout(self)
+		resp(t, xpcall(t[1], error_handler, table.unpack(t, 2)))
+		next_task()
 	end
-
-	request_meta.__close = request_meta.close
-
-	function request_meta:select(timeout)
-		send_requests(self, timeout)
-		return request_iter(self), nil, nil, self
-	end
-
-	function ltask.request(obj)
-		local ret = setmetatable({}, request_meta)
-		if obj then
-			return ret(obj)
+	ltask.fork(next_task)
+	return function()
+		if ret_tail == n and ret_head == ret_tail then
+			return
 		end
-		return ret
-	end
-end
-
--------------
-
-do
-	local function run_parallel(task)
-		local ret = {}
-		local n = #task
-		if n == 0 then
-			return ret
+		while ret_head == ret_tail do
+			token = {}
+			ltask.wait(token)
 		end
-		local function resp(i, ...)
-			ret[i] = { ... }
-		end
-		local idx = 1
-		local function get_task()
-			local r = idx
-			idx = idx + 1
-			return task[r], r
-		end
-		local supervisor_running = false
-		local run_task	-- function
-		local function next_task()
-			local i = idx
-			idx = idx + 1
-			local t = task[i]
-			if t then
-				run_task(t, i)
-			end
-		end
-		local function run_supervisor()
-			supervisor_running = false	-- only one supervisor
-			next_task()
-		end
-		function run_task(t, i)
-			if not supervisor_running then
-				supervisor_running = true
-				ltask.fork(run_supervisor)
-			end
-			resp(i, pcall(t[1], table.unpack(t, 2)))
-			n = n - 1
-			if n == 0 then
-				ltask.wakeup(ret)
-			else
-				return next_task()
-			end
-		end
-		ltask.fork(next_task)
-		ltask.wait(ret)
-		return ret
-	end
-
-	function ltask.parallel(task)
-		local ret = run_parallel(task)
-		local i = 1
-		local err
-		return function()
-			while true do
-				local r = ret[i]
-				local t = task[i]
-				i = i + 1
-				if r then
-					if r[1] then
-						return t, table.unpack(r, 2)
-					else
-						err = true
-					end
-				elseif err then
-					local err_msg = {}
-					for _, v in ipairs(ret) do
-						if not v[1] then
-							table.insert(err_msg, tostring(v[2]))
-						end
-					end
-					error(table.concat(err_msg, "\n"))
-				else
-					return
-				end
-			end
-		end
+		ret_head = ret_head + 1
+		local t = ret[ret_head]
+		ret[ret_head] = nil
+		return t[1], t[2]
 	end
 end
 
@@ -1019,6 +814,16 @@ end
 
 function sys_service.memory()
 	return collectgarbage "count" * 1024
+end
+
+function sys_service.traceback()
+	local tlog = {}
+	local n = 1
+	for session, co in pairs(session_coroutine_suspend_lookup) do
+		tlog[n] = "Session : " ..  tostring(session) ; n = n + 1
+		tlog[n] = debug.traceback(co) ; n = n + 1
+	end
+	return table.concat(tlog, "\n")
 end
 
 local function system(command, ...)
