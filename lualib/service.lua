@@ -33,11 +33,21 @@ end
 
 ltask.log.info ( "startup " .. CURRENT_SERVICE )
 
+
+local coroutine_create = coroutine.create
+local coroutine_resume = coroutine.resume
+local coroutine_close = coroutine.close
+local coroutine_running = coroutine.running
+local coroutine_yield = coroutine.yield
+
 local yield_service = coroutine.yield
 local yield_session = coroutine.yield
+
 local function continue_session()
-	coroutine.yield(true)
+	coroutine_yield(true)
 end
+
+_G.coroutine = nil
 
 local running_thread
 
@@ -288,7 +298,7 @@ end
 
 local function resume_session(co, ...)
 	running_thread = co
-	local ok, errobj = coroutine.resume(co, ...)
+	local ok, errobj = coroutine_resume(co, ...)
 	running_thread = nil
 	if ok then
 		return errobj
@@ -306,7 +316,7 @@ local function resume_session(co, ...)
 		else
 			post_response_message(from, session, MESSAGE_ERROR, ltask.pack(errobj))
 		end
-		coroutine.close(co)
+		coroutine_close(co)
 	end
 end
 
@@ -323,17 +333,17 @@ local coroutine_pool = setmetatable({}, { __mode = "kv" })
 local function new_thread(f)
 	local co = table.remove(coroutine_pool)
 	if co == nil then
-		co = coroutine.create(function(...)
+		co = coroutine_create(function(...)
 			f(...)
 			while true do
 				f = nil
 				coroutine_pool[#coroutine_pool+1] = co
-				f = coroutine.yield()
-				f(coroutine.yield())
+				f = coroutine_yield()
+				f(coroutine_yield())
 			end
 		end)
 	else
-		coroutine.resume(co, f)
+		coroutine_resume(co, f)
 	end
 	return co
 end
@@ -362,8 +372,8 @@ end
 
 ------------- ltask lua api
 
-function ltask.suspend(session, co)
-	session_coroutine_suspend_lookup[session] = co
+function ltask.suspend(session, func)
+	session_coroutine_suspend_lookup[session] = coroutine_create(func)
 end
 
 function ltask.call(address, ...)
@@ -567,6 +577,7 @@ end
 function ltask.fork(func, ...)
 	local co = new_thread(func)
 	wakeup_queue[#wakeup_queue+1] = {co, ...}
+	return co
 end
 
 function ltask.current_session()
@@ -758,7 +769,7 @@ local yieldable_require; do
 		if m ~= nil then
 			return m
 		end
-		local co, main = coroutine.running()
+		local co, main = coroutine_running()
 		if main then
 			return require(name)
 		end
@@ -859,6 +870,9 @@ local function schedule_message()
 		-- new session for this message
 		local co = new_session(f, from, session)
 		wakeup_session(co, type, msg, sz)
+	elseif from == nil then
+		-- no message
+		return
 	else
 		local co = session_coroutine_suspend_lookup[session]
 		if co == nil then
