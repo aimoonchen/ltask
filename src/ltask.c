@@ -56,6 +56,8 @@ struct ltask {
 	struct debug_logger *logger;
 #endif
 	struct logqueue *lqueue;
+	struct queue *external_message;
+	struct message *external_last_message;
 	atomic_int schedule_owner;
 	atomic_int active_worker;
 	atomic_int thread_count;
@@ -382,8 +384,60 @@ get_pending_jobs(struct ltask *task, service_id output[]) {
 	return n;
 }
 
+static int
+send_external_message(struct ltask *task, struct message *msg) {
+	switch (service_push_message(task->services, msg->to, msg)) {
+	case 0 :
+		return 0;
+	case 1 :
+		return 1;	// block
+	default:
+		// root dead, drop message
+		message_delete(msg);
+		return 0;
+	}
+}
+
+static void
+dispatch_external_messages(struct ltask *task) {
+	int send = 0;
+	if (task->external_last_message) {
+		if (send_external_message(task, task->external_last_message))
+			return;	// block
+		task->external_last_message = NULL;
+		send = 1;
+	}
+	void * msg = NULL;
+	while ((msg = queue_pop_ptr(task->external_message))) {
+		struct message m;
+		m.from.id = 0;
+		m.to.id = 1;	// root
+		m.session = (session_t)0;	// no response
+		m.type = MESSAGE_REQUEST;
+		m.msg = seri_packstring("external", 0, msg, &m.sz);
+
+		struct message *em = message_new(&m);
+		if (send_external_message(task, em)) {
+			// block
+			task->external_last_message = em;
+			return;
+		}
+		send = 1;
+	}
+	if (send) {
+		service_id root = {1};
+		check_message_to(task, root);
+	}
+}
+
 static void
 schedule_dispatch(struct ltask *task) {
+	// Step 0 : dispatch external messsages
+
+	if (task->external_message) {
+		dispatch_external_messages(task);
+	}
+
 	// Step 1 : Collect service_done
 	service_id jobs[MAX_WORKER];
 
@@ -686,6 +740,11 @@ ltask_init(lua_State *L) {
 	task->services = service_create(config);
 	task->schedule = queue_new_int(config->max_service);
 	task->timer = NULL;
+	task->external_message = NULL;
+	task->external_last_message = NULL;
+	if (config->external_queue) {
+		task->external_message = queue_new_ptr(config->external_queue);
+	}
 
 #ifdef DEBUGLOG
 	if (lua_getfield(L, 1, "debuglog") == LUA_TSTRING) {
@@ -840,6 +899,8 @@ ltask_wait(lua_State *L) {
 	for (i=0;i<MAX_SOCKEVENT;i++) {
 		sockevent_close(&ctx->task->event[i]);
 	}
+	message_delete(ctx->task->external_last_message);
+	queue_delete(ctx->task->external_message);
 	return 0;
 }
 
@@ -852,10 +913,9 @@ ltask_deinit(lua_State *L) {
 		worker_destory(&task->workers[i]);
 	}
 
-	timer_destroy(task->timer);
-
 	service_destory(task->services);
 	queue_delete(task->schedule);
+	timer_destroy(task->timer);
 
 	lua_pushnil(L);
 	lua_setfield(L, LUA_REGISTRYINDEX, "LTASK_GLOBAL");
@@ -1008,6 +1068,24 @@ ltask_init_socket(lua_State *L) {
 	return 0;
 }
 
+static int
+external_send(void *q, void *v) {
+	return queue_push_ptr((struct queue *)q, v);
+}
+
+static int
+ltask_external_sender(lua_State *L) {
+	luaL_checktype(L, 1, LUA_TUSERDATA);
+	struct task_context *ctx = (struct task_context *)lua_touserdata(L, 1);
+	struct ltask *task = ctx->task;
+	if (task->external_message == NULL) {
+		return luaL_error(L, "No external message queue");
+	}
+	lua_pushlightuserdata(L, (void *)external_send);
+	lua_pushlightuserdata(L, (void *)task->external_message);
+	return 2;
+}
+
 LUAMOD_API int
 luaopen_ltask_bootstrap(lua_State *L) {
 	static atomic_int init = 0;
@@ -1030,6 +1108,7 @@ luaopen_ltask_bootstrap(lua_State *L) {
 		{ "unpack", luaseri_unpack },
 		{ "remove", luaseri_remove },
 		{ "unpack_remove", luaseri_unpack_remove },
+		{ "external_sender", ltask_external_sender },
 		{ NULL, NULL },
 	};
 	
@@ -1261,7 +1340,7 @@ ltask_now(lua_State *L) {
 
 static int
 ltask_counter(lua_State *L) {
-	uint64_t freq = lua_tointeger(L, lua_upvalueindex(1));
+	uint64_t freq = lua_tointeger(L, lua_upvalueindex(2));
 	uint64_t ti = systime_counter();
 	lua_pushnumber(L, (double)ti / freq);
 	return 1;
@@ -1373,7 +1452,7 @@ static int
 ltask_cpucost(lua_State *L) {
 	const struct service_ud *S = getS(L);
 	uint64_t cpucost = service_cpucost(S->task->services, S->id);
-	uint64_t freq = lua_tointeger(L, lua_upvalueindex(1));
+	uint64_t freq = lua_tointeger(L, lua_upvalueindex(2));
 	lua_pushnumber(L, (double)cpucost / freq);
 	return 1;
 }
@@ -1531,8 +1610,9 @@ luaopen_ltask(lua_State *L) {
 	};
 
 	uint64_t f = systime_frequency();
+	lua_pushlightuserdata(L, (void *)ud);
 	lua_pushinteger(L, f);
-	luaL_setfuncs(L,l3,1);
+	luaL_setfuncs(L,l3,2);
 
 	sys_init();
 	return 1;
