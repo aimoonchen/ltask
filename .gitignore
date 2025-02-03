@@ -1,4 +1,6 @@
 3rd/*
 build/*
 *.so
+*.dSYM
 *.dll
+*.dylib
