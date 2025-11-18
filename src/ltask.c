@@ -26,6 +26,7 @@
 #include "logqueue.h"
 #include "systime.h"
 #include "threadsig.h"
+#include "semaphore.h"
 
 LUAMOD_API int luaopen_ltask(lua_State *L);
 LUAMOD_API int luaopen_ltask_bootstrap(lua_State *L);
@@ -44,6 +45,43 @@ LUAMOD_API int luaopen_ltask_root(lua_State *L);
 
 #endif
 
+#define MAINTHREAD_STATUS_NONE 0
+#define MAINTHREAD_STATUS_READY 1
+#define MAINTHREAD_STATUS_YIELD 2
+#define MAINTHREAD_STATUS_FINISH 3
+#define MAINTHREAD_STATUS_INVALID 4
+
+struct mainthread_session {
+	atomic_int srv;
+	struct sem ev;
+	int status;
+};
+
+static void
+mainthread_init(struct mainthread_session *mt) {
+	atomic_int_init(&mt->srv, 0);
+	mt->status = MAINTHREAD_STATUS_NONE;
+	sem_init(&mt->ev);
+}
+
+static void
+mainthread_deinit(struct mainthread_session *mt) {
+	assert(mt->status == MAINTHREAD_STATUS_NONE || mt->status == MAINTHREAD_STATUS_YIELD);
+	atomic_int_store(&mt->srv, 0);
+	mt->status = MAINTHREAD_STATUS_INVALID;
+	sem_deinit(&mt->ev);
+}
+
+static inline int
+mainthread_current(struct mainthread_session *mt, service_id id) {
+	return mt->status == MAINTHREAD_STATUS_READY && atomic_int_load(&mt->srv) == id.id;
+}
+
+static inline void
+mainthread_trigger(struct mainthread_session *mt) {
+	sem_post(&mt->ev);
+}
+
 struct ltask {
 	const struct ltask_config *config;
 	struct worker_thread *workers;
@@ -58,6 +96,7 @@ struct ltask {
 	struct logqueue *lqueue;
 	struct queue *external_message;
 	struct message *external_last_message;
+	struct mainthread_session mt;
 	atomic_int schedule_owner;
 	atomic_int active_worker;
 	atomic_int thread_count;
@@ -654,6 +693,10 @@ thread_worker(void *ud) {
 					} else {
 						service_send_signal(P, id);
 					}
+				} else if (mainthread_current(&w->task->mt, id)) {
+					service_status_set(P, id, SERVICE_STATUS_MAINTHREAD);
+					mainthread_trigger(&w->task->mt);
+					w->running.id = 0;
 				} else {
 					service_status_set(P, id, SERVICE_STATUS_DONE);
 				}
@@ -671,17 +714,19 @@ thread_worker(void *ud) {
 				w->binding = id;
 			}
 
-			while (worker_complete_job(w)) {
-				// Can't complete (running -> done)
-				if (!acquire_scheduler(w)) {
-					if (worker_complete_job(w)) {
-						// Do it self
-						schedule_dispatch(w->task);
-						while (worker_complete_job(w)) {}	// CAS may fail spuriously
+			if (w->running.id) {
+				while (worker_complete_job(w)) {
+					// Can't complete (running -> done)
+					if (!acquire_scheduler(w)) {
+						if (worker_complete_job(w)) {
+							// Do it self
+							schedule_dispatch(w->task);
+							while (worker_complete_job(w)) {}	// CAS may fail spuriously
+						}
+						schedule_dispatch_worker(w);
+						release_scheduler(w);
+						break;
 					}
-					schedule_dispatch_worker(w);
-					release_scheduler(w);
-					break;
 				}
 			}
 		} else {
@@ -777,6 +822,8 @@ ltask_init(lua_State *L) {
 	}
 
 	task->blocked_service = 0;
+	
+	mainthread_init(&task->mt);
 
 	return 1;
 }
@@ -901,6 +948,7 @@ ltask_wait(lua_State *L) {
 	}
 	message_delete(ctx->task->external_last_message);
 	queue_delete(ctx->task->external_message);
+	mainthread_deinit(&ctx->task->mt);
 	return 0;
 }
 
@@ -1096,6 +1144,64 @@ ltask_log_sender(lua_State *L) {
 	return 2;
 }
 
+// run service in mainthread
+
+static int
+lmainthread_wait(lua_State *L) {
+	struct ltask *task = (struct ltask *)get_ptr(L, "LTASK_GLOBAL");
+	struct mainthread_session * mt = &task->mt;
+	if (mt->status != MAINTHREAD_STATUS_NONE && mt->status != MAINTHREAD_STATUS_READY)
+		return luaL_error(L, "mainthread in use");
+	struct service_pool * P = task->services;
+	int inf = !lua_toboolean(L, 1);
+	int finish = 0;
+	do {
+		if (sem_wait(&mt->ev, inf)) {
+			lua_pushboolean(L, 1);	// fail
+			return 1;
+		}
+		if (mt->status != MAINTHREAD_STATUS_READY)
+			luaL_error(L, "mainthread not ready");
+		
+		service_id id = { atomic_int_load(&mt->srv) };
+		atomic_int_store(&mt->srv, 0);
+		
+		debug_printf(task->logger, "service %x run in mainthread", id.id);
+		assert(service_status_get(P, id) == SERVICE_STATUS_MAINTHREAD);
+		if (service_resume(P, id)) {
+			// dead
+			debug_printf(task->logger, "service %x is dead in mainthread", id.id);
+			service_status_set(P, id, SERVICE_STATUS_DEAD);
+			if (id.id != SERVICE_ID_ROOT) {
+				service_send_signal(P, id);
+			}
+		} else {
+			service_status_set(P, id, SERVICE_STATUS_SCHEDULE);
+			switch (mt->status) {
+			case MAINTHREAD_STATUS_YIELD:
+				debug_printf(task->logger, "service %x yield from mainthread", id.id);
+				break;
+			case MAINTHREAD_STATUS_FINISH:
+				debug_printf(task->logger, "service %x finish in mainthread", id.id);
+				finish = 1;
+				break;
+			default:
+				debug_printf(task->logger, "service %x is dead in mainthread", id.id);
+				service_status_set(P, id, SERVICE_STATUS_DEAD);
+				if (id.id != SERVICE_ID_ROOT) {
+					service_send_signal(P, id);
+				}
+				schedule_back(task, id);
+				return luaL_error(L, "Can't yield in mainthread (status = %d), kill service (%d)", mt->status, id.id);
+			}
+		}
+		schedule_back(task, id);
+		mt->status = MAINTHREAD_STATUS_NONE;
+	} while (!finish);
+	atomic_int_store(&mt->srv, 0);
+	return 0;
+}
+
 LUAMOD_API int
 luaopen_ltask_bootstrap(lua_State *L) {
 	static atomic_int init = 0;
@@ -1120,6 +1226,7 @@ luaopen_ltask_bootstrap(lua_State *L) {
 		{ "unpack_remove", luaseri_unpack_remove },
 		{ "external_sender", ltask_external_sender },
 		{ "log_sender", ltask_log_sender },
+		{ "mainthread_wait", lmainthread_wait },
 		{ NULL, NULL },
 	};
 	
@@ -1563,6 +1670,33 @@ ltask_debuglog(lua_State *L) {
 
 #endif
 
+static int
+mainthread_change_status(lua_State *L, int status) {
+	const struct service_ud *S = getS(L);
+	struct ltask *task = S->task;
+	if (atomic_int_cas(&task->mt.srv, 0, S->id.id)) {
+		task->mt.status = status;
+		return 0;
+	} else {
+		return luaL_error(L, "Change mainthread status fail");
+	}
+}
+
+static int
+lmainthread_enter(lua_State *L) {
+	return mainthread_change_status(L, MAINTHREAD_STATUS_READY);
+}
+
+static int
+lmainthread_leave(lua_State *L) {
+	return mainthread_change_status(L, MAINTHREAD_STATUS_FINISH);
+}
+
+static int
+lmainthread_yield(lua_State *L) {
+	return mainthread_change_status(L, MAINTHREAD_STATUS_YIELD);
+}
+
 LUAMOD_API int
 luaopen_ltask(lua_State *L) {
 	luaL_checkversion(L);
@@ -1600,6 +1734,9 @@ luaopen_ltask(lua_State *L) {
 		{ "debuglog", ltask_debuglog },
 		{ "eventinit", ltask_eventinit },
 		{ "eventreset", ltask_eventreset },
+		{ "mainthread_enter", lmainthread_enter },
+		{ "mainthread_leave", lmainthread_leave },
+		{ "mainthread_yield", lmainthread_yield },
 		{ NULL, NULL },
 	};
 
