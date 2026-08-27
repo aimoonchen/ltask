@@ -241,7 +241,7 @@ wb_pointer(struct write_block *wb, void *v, int subtype) {
 }
 
 static inline void
-wb_string(struct write_block *wb, const char *str, int len) {
+wb_string(struct write_block *wb, const char *str, size_t len) {
 	if (len < MAX_COOKIE) {
 		uint8_t n = COMBINE_TYPE(TYPE_SHORT_STRING, len);
 		wb_push(wb, &n, 1);
@@ -259,6 +259,7 @@ wb_string(struct write_block *wb, const char *str, int len) {
 			n = COMBINE_TYPE(TYPE_LONG_STRING, 4);
 			wb_push(wb, &n, 1);
 			uint32_t x = (uint32_t) len;
+			assert(x == len);	// can't fit in 4 bytes
 			wb_push(wb, &x, 4);
 		}
 		wb_push(wb, str, len);
@@ -477,7 +478,7 @@ pack_one(lua_State *L, struct write_block *b, int index) {
 	case LUA_TSTRING: {
 		size_t sz = 0;
 		const char *str = lua_tolstring(L,index,&sz);
-		wb_string(b, str, (int)sz);
+		wb_string(b, str, sz);
 		break;
 	}
 	case LUA_TLIGHTUSERDATA:
@@ -762,14 +763,20 @@ unpack_one(lua_State *L, struct read_block *rb) {
 
 static void *
 seri(struct block *b, int len) {
+	if (len < 0)
+		return NULL;
 	uint8_t * buffer = malloc(len + 4);
 	memcpy(buffer, &len, 4);	// write length
 	uint8_t * ptr = buffer + 4;
 	while(len>0) {
 		if (len >= BLOCK_SIZE) {
+			len -= BLOCK_SIZE;
+			if (len < 0) {
+				free(buffer);
+				return NULL;
+			}
 			memcpy(ptr, b->buffer, BLOCK_SIZE);
 			ptr += BLOCK_SIZE;
-			len -= BLOCK_SIZE;
 			b = b->next;
 		} else {
 			memcpy(ptr, b->buffer, len);
@@ -861,7 +868,7 @@ seri_pack(lua_State *L, int from, int *sz) {
 }
 
 void *
-seri_packstring(const char * str, int sz, void *p, size_t *output) {
+seri_packstring(const char * str, size_t sz, void *p, size_t *output) {
 	struct block temp;
 	temp.next = NULL;
 	struct write_block wb;
@@ -907,6 +914,9 @@ int
 luaseri_pack(lua_State *L) {
 	int sz = 0;
 	void * buffer = seri_pack(L, 0, &sz);
+	if (buffer == NULL) {
+		return luaL_error(L, "block is too large");
+	}
 	lua_pushlightuserdata(L, buffer);
 	lua_pushinteger(L, sz);
 	return 2;
